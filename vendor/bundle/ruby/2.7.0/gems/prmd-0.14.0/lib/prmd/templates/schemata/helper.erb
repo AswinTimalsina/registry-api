@@ -1,0 +1,203 @@
+<%-
+  def extract_attributes(schema, properties)
+    attributes = []
+
+    _, properties = schema.dereference(properties)
+
+    properties.each do |key, value|
+      # found a reference to another element:
+      _, value = schema.dereference(value)
+
+      # include top level reference to nested things, when top level is nullable
+      if value.has_key?('type') && value['type'].include?('null') && (value.has_key?('items') || value.has_key?('properties'))
+        attributes << build_attribute(schema, key, value)
+      end
+
+      if value.has_key?('anyOf')
+        descriptions = []
+        examples = []
+
+        anyof = value['anyOf']
+
+        anyof.each do |ref|
+          _, nested_field = schema.dereference(ref)
+          descriptions << nested_field['description'] if nested_field['description']
+          examples << nested_field['example'] if nested_field['example']
+        end
+
+        # avoid repetition :}
+        description = if descriptions.size > 1
+          descriptions.first.gsub!(/ of (this )?.*/, "")
+          descriptions[1..-1].map { |d| d.gsub!(/unique /, "") }
+          [descriptions[0...-1].join(", "), descriptions.last].join(" or ")
+        else
+          description = descriptions.last
+        end
+
+        example = [*examples].map { |e| "`#{e.to_json}`" }.join(" or ")
+        attributes << [key, "string", description, example]
+
+      # found a nested object
+      elsif value['properties']
+        nested = extract_attributes(schema, value['properties'])
+        nested.each do |attribute|
+          attribute[0] = "#{key}:#{attribute[0]}"
+        end
+        attributes.concat(nested)
+
+      elsif array_with_nested_objects?(value['items'])
+        if value['items']['properties']
+          nested = extract_attributes(schema, value['items']['properties'])
+          nested.each do |attribute|
+            attribute[0] = "#{key}/#{attribute[0]}"
+          end
+          attributes.concat(nested)
+        end
+        if value['items']['oneOf']
+          value['items']['oneOf'].each_with_index do |oneof, index|
+          ref,  oneof_definition = schema.dereference(oneof)
+          oneof_name = ref ? ref.split('/').last : index
+          nested = extract_attributes(schema, oneof_definition['properties'])
+          nested.each do |attribute|
+            attribute[0] = "#{key}/[#{oneof_name.upcase}].#{attribute[0]}"
+          end
+          attributes.concat(nested)
+        end
+      end
+
+      # just a regular attribute
+      else
+        attributes << build_attribute(schema, key, value)
+      end
+    end
+    attributes.map! { |key, type, description, example|
+      if example.nil? && Prmd::DefaultExamples.key?(type)
+        example = "`%s`" % Prmd::DefaultExamples[type].to_json
+      end
+      [key, type, description, example]
+    }
+    return attributes.sort
+  end
+
+  def extract_schemata_refs(schema, properties)
+    ret = []
+    properties.keys.sort.each do |key|
+      value = properties[key]
+      ref, value = schema.dereference(value)
+      if value['properties']
+        refs = extract_schemata_refs(schema, value['properties'])
+      elsif value['items'] && value['items']['properties']
+        refs = extract_schemata_refs(schema, value['items']['properties'])
+      else
+        refs = [ref]
+      end
+      if value.has_key?('type') && value['type'].include?('null') && (value.has_key?('items') || value.has_key?('properties'))
+        # A nullable object usually isn't a reference to another schema. It's
+        # either not a reference at all, or it's a reference within the same
+        # schema. Instead, the definition of the nullable object might contain
+        # references to specific properties.
+        #
+        # If all properties refer to the same schema, we'll use that as the
+        # reference. This might even overwrite an actual, intra-schema
+        # reference.
+
+        l = refs.map {|v| v && v.split("/")[0..2]}
+        if l.uniq.size == 1 && l[0] != nil
+          ref = l[0].join("/")
+        end
+        ret << ref
+      end
+      ret.concat(refs)
+    end
+    ret
+  end
+
+  def build_attribute(schema, key, value)
+    description = value['description'] || ""
+    if value['default']
+      description += "<br/> **default:** `#{value['default'].to_json}`"
+    end
+
+    if value['minimum'] || value['maximum']
+      description += "<br/> **Range:** `"
+      if value['minimum']
+        comparator = value['exclusiveMinimum'] ? "<" : "<="
+        description += "#{value['minimum'].to_json} #{comparator} "
+      end
+      description += "value"
+      if value['maximum']
+        comparator = value['exclusiveMaximum'] ? "<" : "<="
+        description += " #{comparator} #{value['maximum'].to_json}"
+      end
+      description += "`"
+    end
+
+    if value['enum']
+      description += '<br/> **one of:**' + [*value['enum']].map { |e| "`#{e.to_json}`" }.join(" or ")
+    end
+
+    if value['pattern']
+      # Prevent the pipe regex pattern characters from being interpreted as markdown table:
+      pattern = value['pattern'].gsub(/\|/, '&#x7c;')
+
+      description += "<br/> **pattern:** <pre>#{pattern}</pre>"
+    end
+
+    if value['minLength'] || value['maxLength']
+      description += "<br/> **Length:** `"
+      if value['minLength']
+        description += "#{value['minLength'].to_json}"
+      end
+      unless value['minLength'] == value['maxLength']
+        if value['maxLength']
+          unless value['minLength']
+            description += "0"
+          end
+          description += "..#{value['maxLength'].to_json}"
+        else
+          description += "..∞"
+        end
+      end
+      description += "`"
+    end
+
+    if value.has_key?('example')
+      example = if value['example'].is_a?(Hash) && value['example'].has_key?('oneOf')
+        value['example']['oneOf'].map { |e| "`#{e.to_json}`" }.join(" or ")
+      else
+        "`#{value['example'].to_json}`"
+      end
+    elsif (value['type'] == ['array'] && value.has_key?('items')) || value.has_key?('enum')
+      example = "`#{schema.schema_value_example(value).to_json}`"
+    elsif value['type'].include?('null')
+      example = "`null`"
+    end
+
+    type = if value['type'].include?('null')
+      'nullable '
+    else
+      ''
+    end
+    type += (value['format'] || (value['type'] - ['null']).join(' or '))
+    [key, type, description, example]
+  end
+
+
+  def build_link_path(schema, link)
+    link['href'].gsub(%r|(\{\([^\)]+\)\})|) do |ref|
+      ref = ref.gsub('%2F', '/').gsub('%23', '#').gsub(%r|[\{\(\)\}]|, '')
+      identity_key, identity_value = schema.dereference(ref)
+      ref_resource = identity_key.split('#/definitions/').last.split('/').first.gsub('-','_')
+      if identity_value.has_key?('anyOf')
+        '{' + ref_resource + '_' + identity_value['anyOf'].map {|r| r['$ref'].split('/').last}.join('_or_') + '}'
+      else
+        '{' + ref_resource + '_' + identity_key.split('/').last + '}'
+      end
+    end
+  end
+
+  def array_with_nested_objects?(items)
+    return unless items
+    items['properties'] || items['oneOf']
+  end
+%>

@@ -1,0 +1,23 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require 'optparse'
+require 'yaml'
+
+require_relative "../lib/committee"
+
+args = ARGV.dup
+bin = Committee::Bin::CommitteeStub.new
+options, parser = bin.get_options_parser
+
+parser.parse!(args)
+
+if options[:help] || !options[:driver] || args.length < 1
+  # shows help information
+  puts parser.to_s
+else
+  driver = Committee::Drivers.driver_from_name(options[:driver])
+  schema = driver.parse(::YAML.load(File.read(args[0])))
+
+  Rack::Server.start(app: bin.get_app(schema, options), Port: options[:port])
+end

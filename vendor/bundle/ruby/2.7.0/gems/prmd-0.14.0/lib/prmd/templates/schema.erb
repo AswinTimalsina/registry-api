@@ -1,0 +1,27 @@
+<%- if options[:doc][:toc] -%>
+<%=
+  Prmd::Template::load('table_of_contents.erb', options[:template]).result({
+    options: options,
+    schema:  schema
+  })
+%>
+<%- end -%>
+<%=
+  schemata_template = Prmd::Template::load('schemata.md.erb', options[:template])
+
+  schema['properties'].keys.sort.map do |key|
+    resource, property = key, schema['properties'][key]
+    begin
+      _, schemata = schema.dereference(property)
+      schemata_template.result({
+        options:         options,
+        resource:        resource,
+        schema:          schema,
+        schemata:        schemata
+      })
+    rescue => e
+      $stdout.puts("Error in resource: #{resource}")
+      raise e
+    end
+  end.join("\n")
+%>
